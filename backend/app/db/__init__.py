@@ -1,0 +1,53 @@
+"""SQLite persistence layer for FinAlly."""
+
+from .connection import (
+    DEFAULT_CASH_BALANCE,
+    DEFAULT_TICKERS,
+    DEFAULT_USER_ID,
+    get_connection,
+    get_db_path,
+    init_db,
+    transaction,
+)
+from .repository import (
+    add_to_watchlist,
+    delete_position,
+    get_cash_balance,
+    get_chat_messages,
+    get_position,
+    get_positions,
+    get_snapshots,
+    get_trades,
+    get_watchlist,
+    insert_chat_message,
+    insert_snapshot,
+    insert_trade,
+    remove_from_watchlist,
+    set_cash_balance,
+    upsert_position,
+)
+
+__all__ = [
+    "DEFAULT_CASH_BALANCE",
+    "DEFAULT_TICKERS",
+    "DEFAULT_USER_ID",
+    "add_to_watchlist",
+    "delete_position",
+    "get_cash_balance",
+    "get_chat_messages",
+    "get_connection",
+    "get_db_path",
+    "get_position",
+    "get_positions",
+    "get_snapshots",
+    "get_trades",
+    "get_watchlist",
+    "init_db",
+    "insert_chat_message",
+    "insert_snapshot",
+    "insert_trade",
+    "remove_from_watchlist",
+    "set_cash_balance",
+    "transaction",
+    "upsert_position",
+]

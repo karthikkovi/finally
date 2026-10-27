@@ -1,8 +1,9 @@
-"""Massive (Polygon.io) API client for real market data."""
+"""Massive (formerly Polygon.io) REST poller implementing MarketDataSource."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 
 from massive import RESTClient
@@ -15,22 +16,12 @@ logger = logging.getLogger(__name__)
 
 
 class MassiveDataSource(MarketDataSource):
-    """MarketDataSource backed by the Massive (Polygon.io) REST API.
+    """Polls the Massive snapshot endpoint for all active tickers in one call per interval.
 
-    Polls GET /v2/snapshot/locale/us/markets/stocks/tickers for all watched
-    tickers in a single API call, then writes results to the PriceCache.
-
-    Rate limits:
-      - Free tier: 5 req/min → poll every 15s (default)
-      - Paid tiers: higher limits → poll every 2-5s
+    Free tier allows 5 req/min, hence the 15 s default interval.
     """
 
-    def __init__(
-        self,
-        api_key: str,
-        price_cache: PriceCache,
-        poll_interval: float = 15.0,
-    ) -> None:
+    def __init__(self, api_key: str, price_cache: PriceCache, poll_interval: float = 15.0) -> None:
         self._api_key = api_key
         self._cache = price_cache
         self._interval = poll_interval
@@ -40,89 +31,62 @@ class MassiveDataSource(MarketDataSource):
 
     async def start(self, tickers: list[str]) -> None:
         self._client = RESTClient(api_key=self._api_key)
-        self._tickers = list(tickers)
-
-        # Do an immediate first poll so the cache has data right away
+        self._tickers = list(dict.fromkeys(tickers))
         await self._poll_once()
-
         self._task = asyncio.create_task(self._poll_loop(), name="massive-poller")
-        logger.info(
-            "Massive poller started: %d tickers, %.1fs interval",
-            len(tickers),
-            self._interval,
-        )
 
     async def stop(self) -> None:
-        if self._task and not self._task.done():
+        if self._task is not None:
             self._task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
-        self._task = None
+            self._task = None
         self._client = None
-        logger.info("Massive poller stopped")
 
     async def add_ticker(self, ticker: str) -> None:
-        ticker = ticker.upper().strip()
         if ticker not in self._tickers:
             self._tickers.append(ticker)
-            logger.info("Massive: added ticker %s (will appear on next poll)", ticker)
+            # Fetch right away so the new ticker isn't priceless for a whole interval
+            await self._poll_once([ticker])
 
     async def remove_ticker(self, ticker: str) -> None:
-        ticker = ticker.upper().strip()
         self._tickers = [t for t in self._tickers if t != ticker]
         self._cache.remove(ticker)
-        logger.info("Massive: removed ticker %s", ticker)
 
     def get_tickers(self) -> list[str]:
         return list(self._tickers)
 
-    # --- Internal ---
-
     async def _poll_loop(self) -> None:
-        """Poll on interval. First poll already happened in start()."""
         while True:
             await asyncio.sleep(self._interval)
             await self._poll_once()
 
-    async def _poll_once(self) -> None:
-        """Execute one poll cycle: fetch snapshots, update cache."""
-        if not self._tickers or not self._client:
+    async def _poll_once(self, tickers: list[str] | None = None) -> None:
+        tickers = tickers if tickers is not None else list(self._tickers)
+        if not tickers or self._client is None:
             return
-
         try:
-            # The Massive RESTClient is synchronous — run in a thread to
-            # avoid blocking the event loop.
-            snapshots = await asyncio.to_thread(self._fetch_snapshots)
-            processed = 0
-            for snap in snapshots:
-                try:
-                    price = snap.last_trade.price
-                    # Massive timestamps are Unix milliseconds → convert to seconds
-                    timestamp = snap.last_trade.timestamp / 1000.0
-                    self._cache.update(
-                        ticker=snap.ticker,
-                        price=price,
-                        timestamp=timestamp,
-                    )
-                    processed += 1
-                except (AttributeError, TypeError) as e:
-                    logger.warning(
-                        "Skipping snapshot for %s: %s",
-                        getattr(snap, "ticker", "???"),
-                        e,
-                    )
-            logger.debug("Massive poll: updated %d/%d tickers", processed, len(self._tickers))
+            snapshots = await asyncio.to_thread(
+                self._client.get_snapshot_all,
+                market_type=SnapshotMarketType.STOCKS,
+                tickers=tickers,
+            )
+        except Exception as exc:  # network, auth, rate limit — keep polling
+            logger.error("Massive poll failed: %s", exc)
+            return
+        self._process_snapshots(snapshots)
 
-        except Exception as e:
-            logger.error("Massive poll failed: %s", e)
-            # Don't re-raise — the loop will retry on the next interval.
-            # Common failures: 401 (bad key), 429 (rate limit), network errors.
-
-    def _fetch_snapshots(self) -> list:
-        """Synchronous call to the Massive REST API. Runs in a thread."""
-        return self._client.get_snapshot_all(
-            market_type=SnapshotMarketType.STOCKS,
-            tickers=self._tickers,
-        )
+    def _process_snapshots(self, snapshots) -> None:
+        active = set(self._tickers)
+        for snap in snapshots or []:
+            try:
+                ticker = snap.ticker
+                if ticker not in active:
+                    continue
+                price = float(snap.last_trade.price)
+                ts_ms = snap.last_trade.timestamp
+                timestamp = ts_ms / 1000 if ts_ms else None
+                self._cache.update(ticker, price, timestamp=timestamp)
+            except (AttributeError, TypeError, ValueError) as exc:
+                ticker = getattr(snap, "ticker", "?")
+                logger.warning("Skipping malformed snapshot %r: %s", ticker, exc)
